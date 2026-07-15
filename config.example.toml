@@ -1,0 +1,49 @@
+# MiMo v2.5 语音克隆插件配置模板
+
+[plugin]
+enabled = true
+config_version = "2.3.0"
+
+[general]
+max_text_length = 300
+timeout = 120
+
+[trigger]
+# 三选一：
+# llm_trigger：默认优先发语音，LLM 判断内容更适合文字时改用文字（默认）
+# random：按 probability 随机把整条回复转换成语音
+# voice_only：所有纯文本回复都转换成语音
+mode = "llm_trigger"
+probability = 0.3
+random_decision_ttl = 8.0
+# LLM 选择文字后，当前回复会话保持文字的有效时间；窗口内支持多段文字。
+text_override_ttl = 15.0
+
+[voice]
+# 支持：aac/flac/m4a/mp3/mpeg/ogg/opus/wav/wma
+voice_dir = 'E:\bot\缇宝_ZH'
+clone_prompt = "用原本的音色和语气说话，保持自然流畅，不要改变声线和说话习惯"
+# 留空时从 PATH 自动查找 ffmpeg。
+ffmpeg_path = ""
+# 三选一：
+# best_single：自动选择静音少、长度合适的一段，裁掉首尾静音并生成无损 WAV（默认，音色最稳定）
+# balanced：目录内每个文件截取短片段后合并为无损 WAV
+# full_merge：完整合并全部文件并编码为 MP3（兼容旧行为，不建议用于大量音频）
+reference_strategy = "best_single"
+# best_single 模式可指定文件名；留空时自动选择。
+preferred_reference_file = ""
+max_clip_duration = 15.0
+balanced_clip_duration = 3.0
+silence_threshold_db = -45.0
+sample_rate = 24000
+# 仅 full_merge 模式使用。
+reference_bitrate_kbps = 64
+# MiMo 要求参考音频 Base64 不超过 10 MB，预留少量余量。
+max_reference_base64_mb = 9.5
+
+[mimo]
+api_key = "你的_MiMo_API_Key"
+# 可以填写基础地址，也可以直接填写以 /chat/completions 结尾的完整地址。
+api_base_url = "https://api.xiaomimimo.com/v1"
+model = "mimo-v2.5-tts-voiceclone"
+audio_format = "mp3"
