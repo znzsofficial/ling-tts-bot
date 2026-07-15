@@ -21,7 +21,8 @@ text_override_ttl = 15.0
 
 [voice]
 # 支持：aac/flac/m4a/mp3/mpeg/ogg/opus/wav/wma
-voice_dir = 'E:\bot\缇宝_ZH'
+# 参考音频文件存放目录
+voice_dir = 'D:\AAA\AAA'
 clone_prompt = "用原本的音色和语气说话，保持自然流畅，不要改变声线和说话习惯"
 # 留空时从 PATH 自动查找 ffmpeg。
 ffmpeg_path = ""
