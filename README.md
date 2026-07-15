@@ -28,7 +28,7 @@
 git clone https://github.com/Ling-LA/ling-tts-bot.git plugins/ling_tts-bot
 ```
 
-也可以下载仓库源码并解压到 `MaiBot/plugins/ling_tts-bot`。首次加载后，MaiBot 会根据配置模型生成 `config.toml`；也可复制 `config.example.toml` 作为配置起点。不要把包含 API Key 的 `config.toml` 提交到 Git。
+也可以下载仓库源码并解压到 `MaiBot/plugins/ling_tts-bot`。首次加载后，MaiBot 会根据配置模型生成 `config.toml`；也可复制 `config.example.toml` 作为配置起点。
 
 ## 配置
 
@@ -51,7 +51,6 @@ git clone https://github.com/Ling-LA/ling-tts-bot.git plugins/ling_tts-bot
 
 参考音频较多时建议保持 `voice.reference_strategy = "best_single"`。如需手动固定最接近目标音色的一段，可在 `voice.preferred_reference_file` 填写文件名；若必须让目录内每个文件都参与，则使用 `balanced`。
 
-普通 `sk-` Key 应搭配 `https://api.xiaomimimo.com/v1`；Token Plan 地址使用 `tp-` Key，二者不能混用。
 
 已有 `config.toml` 不必重建；未配置参考策略时默认使用 `best_single`，未配置 `trigger.mode` 时默认使用 `llm_trigger`。
 
