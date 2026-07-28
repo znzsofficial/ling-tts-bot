@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "ling.tts-bot",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "name": "TTS语音插件",
   "description": "MiMo v2.5 音色克隆语音合成，支持语音优先、随机和只发语音三种热重载模式。",
   "author": { "name": "Ling-LA", "url": "https://github.com/Ling-LA" },

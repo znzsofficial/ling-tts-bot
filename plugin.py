@@ -23,8 +23,6 @@ import aiohttp
 
 
 AUDIO_SUFFIXES = frozenset({".aac", ".flac", ".m4a", ".mp3", ".mpeg", ".ogg", ".opus", ".wav", ".wma"})
-PLUGIN_DIR = Path(__file__).resolve().parent
-CACHE_DIR = PLUGIN_DIR.parents[1] / "data" / "ling_tts-bot"
 TEXT_REPLY_TOOL_NAME = "ling_text_reply"
 
 
@@ -128,6 +126,7 @@ class LingTTSBot(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._session: Optional[aiohttp.ClientSession] = None
+        self._cache_dir: Optional[Path] = None
         self._reference_lock = asyncio.Lock()
         self._synthesis_lock = asyncio.Lock()
         self._reference_signature = ""
@@ -138,6 +137,8 @@ class LingTTSBot(MaiBotPlugin):
     async def on_load(self) -> None:
         """加载并校验参考音频。"""
 
+        self._cache_dir = self.ctx.paths.runtime_dir
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
         if not self.config.plugin.enabled:
             self.ctx.logger.info("TTS 插件已禁用")
             return
@@ -151,6 +152,7 @@ class LingTTSBot(MaiBotPlugin):
         """释放 HTTP 连接和运行时缓存。"""
 
         await self._close_session()
+        self._cache_dir = None
         self._reference_uri = None
         self._reference_signature = ""
         self._random_decisions.clear()
@@ -403,13 +405,16 @@ class LingTTSBot(MaiBotPlugin):
 
     async def _ensure_reference_uri(self) -> str:
         async with self._reference_lock:
+            if self._cache_dir is None:
+                raise RuntimeError("TTS 缓存目录尚未初始化，请确认插件已完成 on_load")
+
             audio_files = self._audio_files()
             signature = self._build_reference_signature(audio_files)
             if self._reference_uri is not None and signature == self._reference_signature:
                 return self._reference_uri
 
             output_suffix = ".mp3" if self.config.voice.reference_strategy == "full_merge" else ".wav"
-            output_path = CACHE_DIR / f"reference-{signature}{output_suffix}"
+            output_path = self._cache_dir / f"reference-{signature}{output_suffix}"
             if not output_path.is_file():
                 await asyncio.to_thread(self._merge_reference_audio, audio_files, output_path)
 
