@@ -9,8 +9,9 @@
 - 支持 `llm_trigger`、`random`、`voice_only` 三种触发模式，默认 `llm_trigger` 语音优先模式。
 - 语音优先模式下，普通回复默认转换为语音；LLM 判断代码、网址、表格等内容更适合文字时，可让当前回复会话内的多段消息保留文字和引用关系。
 - 配置热重载后立即切换模式、API 参数和参考音频。
-- 在出站阶段把纯文本原位替换为语音，避免同一回复同时发送文字和语音。
-- QQ 不支持“引用消息 + 语音”组合；转换语音时会自动移除引用段，确保语音实际送达。
+- 支持音色克隆（`mimo-v2.5-tts-voiceclone`）和预置音色（`mimo-v2.5-tts`，不需要参考音频）。
+- `text_and_voice` 先发文字、再另发一条语音。QQ 不投递「文字+语音」或「引用+语音」塞在同一条里的消息，所以拆成两条。
+- `voice_only` 仍把纯文本原位替换为语音，并自动去掉引用段。
 
 ## 环境要求
 
@@ -32,10 +33,20 @@ git clone https://github.com/Ling-LA/ling-tts-bot.git plugins/ling_tts-bot
 
 ## 配置
 
-1. 确保系统已安装 FFmpeg，或在 `voice.ffmpeg_path` 中填写可执行文件路径。
+1. 确保系统已安装 FFmpeg，或在 `voice.ffmpeg_path` 中填写可执行文件路径。预置音色模式不调用 FFmpeg。
 2. 在 `mimo.api_key` 中填写 MiMo API Key。
-3. 在 `voice.voice_dir` 中填写参考音频目录。
-4. 按需设置 `trigger.mode`，保存配置即可热重载。
+3. 音色克隆时在 `voice.voice_dir` 中填写参考音频目录。预置音色把 `mimo.synthesis_mode` 设为 `preset`，并用 `mimo.preset_voice` 选择音色。
+4. 按需设置 `trigger.mode` 和 `output.mode`，保存配置即可热重载。
+
+合成模式：
+
+- `voiceclone`：用参考音频克隆，模型 `mimo-v2.5-tts-voiceclone`。
+- `preset`：预置音色，模型 `mimo-v2.5-tts`。中文女声 `冰糖` / `茉莉`，中文男声 `苏打` / `白桦`；英文 `Mia` / `Chloe` / `Milo` / `Dean`；`mimo_default` 跟随集群（中国集群为冰糖）。
+
+输出模式：
+
+- `text_and_voice`：文字照常发送（引用保留），成功后再补一条不带引用的语音。合成失败时文字仍然保留。
+- `voice_only`：纯文本替换成语音，合成失败则这条回复不发出。
 
 触发模式：
 
@@ -52,11 +63,13 @@ git clone https://github.com/Ling-LA/ling-tts-bot.git plugins/ling_tts-bot
 参考音频较多时建议保持 `voice.reference_strategy = "best_single"`。如需手动固定最接近目标音色的一段，可在 `voice.preferred_reference_file` 填写文件名；若必须让目录内每个文件都参与，则使用 `balanced`。
 
 
-已有 `config.toml` 不必重建；未配置参考策略时默认使用 `best_single`，未配置 `trigger.mode` 时默认使用 `llm_trigger`。
+已有 `config.toml` 会在版本升到 `2.5.0` 时补上新字段。未配置时：参考策略 `best_single`，触发 `llm_trigger`，合成 `voiceclone`，输出 `text_and_voice`。
+
+测试命令白名单在 `command.allowed_user_ids`，填写允许使用 `/tts` 的 QQ 号。留空时命令不生效，这是设计，不是故障。自动语音回复不看这份名单。
 
 ## 使用示例
 
-可使用 `/tts 你好呀` 手动验证合成与发送链路。
+白名单中的用户可使用 `/tts 你好呀` 手动验证合成与发送链路。
 
 ## 许可证
 

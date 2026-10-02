@@ -24,6 +24,19 @@ import aiohttp
 
 AUDIO_SUFFIXES = frozenset({".aac", ".flac", ".m4a", ".mp3", ".mpeg", ".ogg", ".opus", ".wav", ".wma"})
 TEXT_REPLY_TOOL_NAME = "ling_text_reply"
+PRESET_MODEL = "mimo-v2.5-tts"
+VOICECLONE_MODEL = "mimo-v2.5-tts-voiceclone"
+PRESET_VOICES = (
+    "mimo_default",
+    "冰糖",
+    "茉莉",
+    "苏打",
+    "白桦",
+    "Mia",
+    "Chloe",
+    "Milo",
+    "Dean",
+)
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -32,7 +45,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_label__ = "插件"
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="2.3.0", description="配置版本")
+    config_version: str = Field(default="2.5.0", description="配置版本")
 
 
 class GeneralConfig(PluginConfigBase):
@@ -97,6 +110,28 @@ class VoiceConfig(PluginConfigBase):
     )
 
 
+class OutputConfig(PluginConfigBase):
+    """出站内容配置。"""
+
+    __ui_label__ = "输出"
+
+    mode: Literal["voice_only", "text_and_voice"] = Field(
+        default="text_and_voice",
+        description="voice_only=只发语音并替换原文；text_and_voice=保留文字，并另发一条语音",
+    )
+
+
+class CommandConfig(PluginConfigBase):
+    """测试命令白名单。留空时 /tts 不生效。"""
+
+    __ui_label__ = "测试命令"
+
+    allowed_user_ids: List[str] = Field(
+        default_factory=list,
+        description="允许使用 /tts、/voice、/mimo 的 QQ 号。留空时命令不生效",
+    )
+
+
 class MiMoConfig(PluginConfigBase):
     """MiMo API 配置。"""
 
@@ -104,7 +139,18 @@ class MiMoConfig(PluginConfigBase):
 
     api_key: str = Field(default="", description="MiMo API Key")
     api_base_url: str = Field(default="https://api.xiaomimimo.com/v1", description="MiMo API 基础地址或完整接口地址")
-    model: str = Field(default="mimo-v2.5-tts-voiceclone")
+    synthesis_mode: Literal["voiceclone", "preset"] = Field(
+        default="voiceclone",
+        description="voiceclone=参考音频克隆；preset=预置音色，不需要参考音频",
+    )
+    model: str = Field(
+        default=VOICECLONE_MODEL,
+        description="音色克隆使用的模型；preset 模式固定使用 mimo-v2.5-tts，忽略此项",
+    )
+    preset_voice: Literal["mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"] = Field(
+        default="冰糖",
+        description="预置音色。中文：冰糖/茉莉（女）、苏打/白桦（男）；英文：Mia/Chloe（女）、Milo/Dean（男）",
+    )
     audio_format: Literal["mp3", "wav"] = Field(default="mp3", description="合成音频格式")
 
 
@@ -114,6 +160,8 @@ class PluginConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     trigger: TriggerConfig = Field(default_factory=TriggerConfig)
+    output: OutputConfig = Field(default_factory=OutputConfig)
+    command: CommandConfig = Field(default_factory=CommandConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     mimo: MiMoConfig = Field(default_factory=MiMoConfig)
 
@@ -133,6 +181,7 @@ class LingTTSBot(MaiBotPlugin):
         self._reference_uri: Optional[str] = None
         self._random_decisions: Dict[str, Tuple[float, bool]] = {}
         self._text_override_sessions: Dict[str, float] = {}
+        self._bypass_counts: Dict[str, int] = {}
 
     async def on_load(self) -> None:
         """加载并校验参考音频。"""
@@ -142,11 +191,22 @@ class LingTTSBot(MaiBotPlugin):
         if not self.config.plugin.enabled:
             self.ctx.logger.info("TTS 插件已禁用")
             return
-        try:
-            await self._ensure_reference_uri()
-        except (OSError, RuntimeError, ValueError) as exc:
-            self.ctx.logger.error("参考音频加载失败：%s", exc)
-        self.ctx.logger.info("TTS 插件已加载，触发模式=%s", self.config.trigger.mode)
+        if self._uses_voiceclone():
+            try:
+                await self._ensure_reference_uri()
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.ctx.logger.error("参考音频加载失败：%s", exc)
+        allowed_users = self._allowed_command_users()
+        if allowed_users:
+            self.ctx.logger.info("TTS 测试命令白名单 %d 人", len(allowed_users))
+        else:
+            self.ctx.logger.info("TTS 测试命令白名单为空，/tts 不生效")
+        self.ctx.logger.info(
+            "TTS 插件已加载，触发=%s, 合成=%s, 输出=%s",
+            self.config.trigger.mode,
+            self.config.mimo.synthesis_mode,
+            self.config.output.mode,
+        )
 
     async def on_unload(self) -> None:
         """释放 HTTP 连接和运行时缓存。"""
@@ -157,6 +217,7 @@ class LingTTSBot(MaiBotPlugin):
         self._reference_signature = ""
         self._random_decisions.clear()
         self._text_override_sessions.clear()
+        self._bypass_counts.clear()
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         """配置热重载后立即刷新模式、HTTP 会话和参考音频。"""
@@ -170,12 +231,20 @@ class LingTTSBot(MaiBotPlugin):
         self._reference_signature = ""
         self._random_decisions.clear()
         self._text_override_sessions.clear()
-        if self.config.plugin.enabled:
+        self._bypass_counts.clear()
+        if self.config.plugin.enabled and self._uses_voiceclone():
             try:
                 await self._ensure_reference_uri()
             except (OSError, RuntimeError, ValueError) as exc:
                 self.ctx.logger.error("热重载参考音频失败：%s", exc)
-        self.ctx.logger.info("TTS 配置已热重载：version=%s, mode=%s", version, self.config.trigger.mode)
+        self.ctx.logger.info(
+            "TTS 配置已热重载：version=%s, 触发=%s, 合成=%s, 输出=%s, 测试命令白名单=%d",
+            version,
+            self.config.trigger.mode,
+            self.config.mimo.synthesis_mode,
+            self.config.output.mode,
+            len(self._allowed_command_users()),
+        )
 
     async def _close_session(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -454,6 +523,21 @@ class LingTTSBot(MaiBotPlugin):
             return api_url
         return f"{api_url}/chat/completions"
 
+    def _uses_voiceclone(self) -> bool:
+        return self.config.mimo.synthesis_mode == "voiceclone"
+
+    def _resolved_model(self) -> str:
+        if not self._uses_voiceclone():
+            return PRESET_MODEL
+        return self.config.mimo.model.strip() or VOICECLONE_MODEL
+
+    def _resolved_preset_voice(self) -> str:
+        voice = self.config.mimo.preset_voice.strip() or "冰糖"
+        if voice not in PRESET_VOICES:
+            supported = "、".join(PRESET_VOICES)
+            raise ValueError(f"不支持的预置音色：{voice}；可选 {supported}")
+        return voice
+
     def _validate_credentials(self) -> None:
         api_key = self.config.mimo.api_key.strip()
         api_url = self.config.mimo.api_base_url.strip().lower()
@@ -481,18 +565,20 @@ class LingTTSBot(MaiBotPlugin):
             raise ValueError("待合成文本为空")
 
         async with self._synthesis_lock:
-            reference_uri = await self._ensure_reference_uri()
             prompt = style.strip() or self.config.voice.clone_prompt.strip()
+            messages: List[Dict[str, str]] = []
+            if prompt:
+                messages.append({"role": "user", "content": prompt})
+            messages.append({"role": "assistant", "content": clean_text})
+            audio_payload: Dict[str, str] = {"format": self.config.mimo.audio_format}
+            if self._uses_voiceclone():
+                audio_payload["voice"] = await self._ensure_reference_uri()
+            else:
+                audio_payload["voice"] = self._resolved_preset_voice()
             body = {
-                "model": self.config.mimo.model,
-                "messages": [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": clean_text},
-                ],
-                "audio": {
-                    "format": self.config.mimo.audio_format,
-                    "voice": reference_uri,
-                },
+                "model": self._resolved_model(),
+                "messages": messages,
+                "audio": audio_payload,
             }
             headers = {
                 "api-key": self.config.mimo.api_key,
@@ -520,7 +606,12 @@ class LingTTSBot(MaiBotPlugin):
             raise RuntimeError("MiMo API 响应中缺少有效的 choices[0].message.audio.data") from exc
         if len(audio) < 100:
             raise RuntimeError("MiMo API 返回的音频数据过短")
-        self.ctx.logger.info("MiMo 合成完成：音频=%dKB, 文本=%s", len(audio) // 1024, clean_text[:40])
+        self.ctx.logger.info(
+            "MiMo 合成完成：模型=%s, 音频=%dKB, 文本=%s",
+            self._resolved_model(),
+            len(audio) // 1024,
+            clean_text[:40],
+        )
         return audio
 
     @staticmethod
@@ -562,38 +653,73 @@ class LingTTSBot(MaiBotPlugin):
             }
         return enabled
 
-    @HookHandler(
-        "send_service.before_send",
-        name="ling_tts_before_send",
-        description="按配置把纯文本回复原位转换为语音，或执行 LLM 的一次性文字选择",
-        mode=HookMode.BLOCKING,
-        order=HookOrder.LATE,
-        timeout_ms=300000,
-        error_policy=ErrorPolicy.SKIP,
-    )
-    async def convert_outbound_text(self, message: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        """在出站消息真正发送前，将纯文本组件替换为语音组件。"""
+    def _enter_bypass(self, stream_id: str) -> None:
+        self._bypass_counts[stream_id] = self._bypass_counts.get(stream_id, 0) + 1
 
+    def _exit_bypass(self, stream_id: str) -> None:
+        remaining = self._bypass_counts.get(stream_id, 0) - 1
+        if remaining <= 0:
+            self._bypass_counts.pop(stream_id, None)
+        else:
+            self._bypass_counts[stream_id] = remaining
+
+    def _is_bypassed(self, stream_id: str) -> bool:
+        return self._bypass_counts.get(stream_id, 0) > 0
+
+    def _should_voice(self, stream_id: str) -> bool:
+        """当前这条纯文本是否要配语音。文字豁免窗口内返回 False。"""
+
+        if self._is_bypassed(stream_id):
+            return False
+        mode = self.config.trigger.mode
+        if mode == "llm_trigger":
+            return not self._text_override_active(stream_id)
+        if mode == "voice_only":
+            return True
+        if mode == "random":
+            return self._random_voice_enabled(stream_id)
+        return False
+
+    def _outbound_candidate(
+        self,
+        message: Optional[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+    ) -> Optional[Tuple[Dict[str, Any], str, str]]:
         if not self.config.plugin.enabled:
             return None
         outbound = message if isinstance(message, dict) else {}
         text = self._plain_text_message(outbound)
         if text is None:
             return None
-
         stream_id = self._stream_id(outbound, kwargs)
         if not stream_id:
             self.ctx.logger.error("出站 TTS 无法获取真实聊天流 session_id")
             return None
-        mode = self.config.trigger.mode
-        if mode == "llm_trigger" and self._text_override_active(stream_id):
+        return outbound, stream_id, text
+
+    @HookHandler(
+        "send_service.before_send",
+        name="ling_tts_before_send",
+        description="voice_only 时把纯文本原位替换为语音；text_and_voice 时保留原文",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=300000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def convert_outbound_text(self, message: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """在出站消息真正发送前，按输出模式决定是替换成语音还是放行文字。"""
+
+        candidate = self._outbound_candidate(message, kwargs)
+        if candidate is None:
+            return None
+        outbound, stream_id, text = candidate
+        if self.config.trigger.mode == "llm_trigger" and self._text_override_active(stream_id):
             self.ctx.logger.info("LLM 已选择文字回复，保留聊天流 %s 的文字及引用关系", stream_id)
             return None
-
-        should_convert = mode in {"llm_trigger", "voice_only"} or (
-            mode == "random" and self._random_voice_enabled(stream_id)
-        )
-        if not should_convert:
+        # QQ 不投递「文字段 + 语音段」或「引用段 + 语音段」。文字另走原消息，语音在 after_send 单发。
+        if self.config.output.mode == "text_and_voice":
+            return None
+        if not self._should_voice(stream_id):
             return None
 
         try:
@@ -625,6 +751,41 @@ class LingTTSBot(MaiBotPlugin):
         return {"action": "continue", "modified_kwargs": kwargs}
 
     @HookHandler(
+        "send_service.after_send",
+        name="ling_tts_after_send",
+        description="文字发送成功后另发一条语音，避免和文字挤在同一条 QQ 消息里",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        timeout_ms=300000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def send_companion_voice(self, message: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
+        """text_and_voice：原文已经发出后，再补一条不带引用的语音。"""
+
+        if self.config.output.mode != "text_and_voice":
+            return None
+        if not bool(kwargs.get("sent")):
+            return None
+        candidate = self._outbound_candidate(message, kwargs)
+        if candidate is None:
+            return None
+        _outbound, stream_id, text = candidate
+        if not self._should_voice(stream_id):
+            return None
+
+        try:
+            audio = await self._synthesize(text)
+            sent = await self._send_voice(audio, stream_id, text, remember_history=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.ctx.logger.error("补发语音失败，文字已保留：%s", exc)
+            return None
+        if sent:
+            self.ctx.logger.info("已为聊天流 %s 在文字之外补发语音", stream_id)
+        else:
+            self.ctx.logger.error("补发语音未被接受，文字已保留")
+        return None
+
+    @HookHandler(
         "maisaka.planner.before_request",
         name="ling_tts_planner_mode",
         description="根据热重载后的触发模式控制 LLM 语音工具是否可见",
@@ -645,19 +806,24 @@ class LingTTSBot(MaiBotPlugin):
         elif self.config.trigger.mode == "llm_trigger":
             messages = kwargs.get("messages")
             if isinstance(messages, list):
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "当前回复模式为语音优先：通常直接调用 reply，插件会自动把纯文本回复转换为语音。"
-                            "仅当内容确实更适合文字展示（例如代码、网址、表格、长列表、精确格式，或用户明确要求文字）时，"
-                            "先调用 ling_text_reply，再调用 reply；当前回复会话中的文字消息都会保留文字和引用关系。"
-                            "不要仅因为回复引用了消息就选择文字，也不要在一次回复中同时发送文字和语音。"
-                        ),
-                    }
-                )
+                messages.append({"role": "system", "content": self._planner_instruction()})
                 kwargs["messages"] = messages
         return {"action": "continue", "modified_kwargs": kwargs}
+
+    def _planner_instruction(self) -> str:
+        if self.config.output.mode == "text_and_voice":
+            return (
+                "当前回复会同时给出文字和语音：直接调用 reply，插件会保留文字并额外发送一条语音。"
+                "仅当内容不适合朗读（代码、网址、表格、长列表、精确格式，或用户明确只要文字）时，"
+                "先调用 ling_text_reply，再调用 reply；当前回复会话只发文字、不发语音，并保留引用。"
+                "不要仅因为回复引用了消息就选择文字。"
+            )
+        return (
+            "当前回复模式为只发语音：通常直接调用 reply，插件会自动把纯文本回复转换为语音。"
+            "仅当内容确实更适合文字展示（例如代码、网址、表格、长列表、精确格式，或用户明确要求文字）时，"
+            "先调用 ling_text_reply，再调用 reply；当前回复会话中的文字消息都会保留文字和引用关系。"
+            "不要仅因为回复引用了消息就选择文字，也不要在一次回复中同时发送文字和语音。"
+        )
 
     @staticmethod
     def _tool_definition_name(definition: Any) -> str:
@@ -668,25 +834,32 @@ class LingTTSBot(MaiBotPlugin):
             return str(function.get("name") or "").rsplit(".", 1)[-1]
         return str(definition.get("name") or "").rsplit(".", 1)[-1]
 
-    async def _send_voice(self, audio: bytes, stream_id: str, processed_text: str) -> bool:
+    async def _send_voice(
+        self,
+        audio: bytes,
+        stream_id: str,
+        processed_text: str,
+        *,
+        remember_history: bool,
+    ) -> bool:
         audio_base64 = base64.b64encode(audio).decode("ascii")
         sent = await self.ctx.send.custom(
             "voice",
             audio_base64,
             stream_id,
             processed_plain_text=processed_text,
-            sync_to_maisaka_history=True,
+            sync_to_maisaka_history=remember_history,
             maisaka_source_kind="tool_voice",
         )
         return bool(sent)
 
     @Tool(
         TEXT_REPLY_TOOL_NAME,
-        brief_description="在语音优先模式下，让当前回复会话使用文字并支持正常引用",
+        brief_description="让当前回复会话只发文字、不附带语音",
         detailed_description=(
-            "默认不要调用：普通 reply 会自动转换为语音。"
-            "仅当代码、网址、表格、长列表、精确格式或用户明确要求文字时调用，"
-            "然后调用普通 reply；当前回复会话中的文字消息会保留为文字，并可正常引用消息。"
+            "默认不要调用。"
+            "仅当代码、网址、表格、长列表、精确格式或用户明确只要文字时调用，"
+            "然后调用普通 reply；当前回复会话不再附加或替换为语音，并可正常引用消息。"
         ),
         activation_type=ActivationType.ALWAYS,
         parameters=[
@@ -723,6 +896,27 @@ class LingTTSBot(MaiBotPlugin):
             "method": "text",
         }
 
+    def _allowed_command_users(self) -> set[str]:
+        return {str(item).strip() for item in self.config.command.allowed_user_ids if str(item).strip()}
+
+    @staticmethod
+    def _message_user_id(message: Any) -> str:
+        if not isinstance(message, dict):
+            return ""
+        info = message.get("message_info") or {}
+        if not isinstance(info, dict):
+            return ""
+        user = info.get("user_info") or {}
+        if not isinstance(user, dict):
+            return ""
+        return str(user.get("user_id") or "").strip()
+
+    def _command_sender_id(self, user_id: str, kwargs: Dict[str, Any]) -> str:
+        sender = str(user_id or kwargs.get("user_id") or "").strip()
+        if sender:
+            return sender
+        return self._message_user_id(kwargs.get("message"))
+
     @Command(
         "ling_tts_cmd",
         description="手动将文字转换为语音",
@@ -731,12 +925,18 @@ class LingTTSBot(MaiBotPlugin):
     async def cmd_tts(
         self,
         stream_id: str = "",
+        user_id: str = "",
         matched_groups: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Tuple[bool, str, bool]:
-        """处理手动 TTS 测试命令。"""
+        """处理手动 TTS 测试命令。白名单为空或不包含发送者时不生效。"""
 
-        del kwargs
+        sender = self._command_sender_id(user_id, kwargs)
+        allowed_users = self._allowed_command_users()
+        if sender not in allowed_users:
+            self.ctx.logger.info("拒绝 /tts：用户 %s 不在白名单", sender or "未知")
+            return False, "测试命令未对你开放", True
+
         text = str((matched_groups or {}).get("text") or "").strip()
         if not stream_id:
             return False, "缺少真实聊天流 session_id", True
@@ -744,13 +944,27 @@ class LingTTSBot(MaiBotPlugin):
             return False, "用法：/tts <文本>", True
 
         clean_text = self._clean_text(text)[: self.config.general.max_text_length]
+        send_text = self.config.output.mode == "text_and_voice"
+        self._enter_bypass(stream_id)
         try:
+            if send_text:
+                await self.ctx.send.text(
+                    clean_text,
+                    stream_id,
+                    processed_plain_text=clean_text,
+                    sync_to_maisaka_history=True,
+                    maisaka_source_kind="tool_text",
+                )
             audio = await self._synthesize(clean_text)
-            sent = await self._send_voice(audio, stream_id, clean_text)
+            sent = await self._send_voice(audio, stream_id, clean_text, remember_history=not send_text)
         except (OSError, RuntimeError, ValueError) as exc:
             self.ctx.logger.error("手动 TTS 失败：%s", exc)
             return False, f"语音合成失败：{exc}", True
-        return (True, "语音已发送", True) if sent else (False, "语音发送失败", True)
+        finally:
+            self._exit_bypass(stream_id)
+        if not sent:
+            return False, "语音发送失败", True
+        return (True, "文字和语音已发送", True) if send_text else (True, "语音已发送", True)
 
 
 def create_plugin() -> LingTTSBot:
