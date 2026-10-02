@@ -45,7 +45,7 @@ git clone https://github.com/Ling-LA/ling-tts-bot.git plugins/ling_tts-bot
 
 输出模式：
 
-- `text_and_voice`：文字照常发送（引用保留），成功后再补一条不带引用的语音。合成失败时文字仍然保留。
+- `text_and_voice`：文字照常发送（引用保留在文字那条上），成功后再补一条不带引用的语音。带引用的回复也会补发。合成失败或正文没有可朗读内容时，文字仍然保留。命令回执不会再被合成。
 - `voice_only`：纯文本替换成语音，合成失败则这条回复不发出。
 
 触发模式：

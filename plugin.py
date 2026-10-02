@@ -24,6 +24,18 @@ import aiohttp
 
 AUDIO_SUFFIXES = frozenset({".aac", ".flac", ".m4a", ".mp3", ".mpeg", ".ogg", ".opus", ".wav", ".wma"})
 TEXT_REPLY_TOOL_NAME = "ling_text_reply"
+FFMPEG_TIMEOUT_SECONDS = 60
+REFERENCE_CACHE_NAME = re.compile(r"^reference-[0-9a-f]{64}\.(?:wav|mp3)$")
+PLUGIN_NOTICE_EXACT = frozenset(
+    {
+        "测试命令未对你开放",
+        "语音已发送",
+        "文字和语音已发送",
+        "语音发送失败",
+        "缺少真实聊天流 session_id",
+        "用法：/tts <文本>",
+    }
+)
 PRESET_MODEL = "mimo-v2.5-tts"
 VOICECLONE_MODEL = "mimo-v2.5-tts-voiceclone"
 PRESET_VOICES = (
@@ -226,17 +238,18 @@ class LingTTSBot(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
 
-        await self._close_session()
-        self._reference_uri = None
-        self._reference_signature = ""
-        self._random_decisions.clear()
-        self._text_override_sessions.clear()
-        self._bypass_counts.clear()
-        if self.config.plugin.enabled and self._uses_voiceclone():
-            try:
-                await self._ensure_reference_uri()
-            except (OSError, RuntimeError, ValueError) as exc:
-                self.ctx.logger.error("热重载参考音频失败：%s", exc)
+        async with self._synthesis_lock:
+            await self._close_session()
+            self._reference_uri = None
+            self._reference_signature = ""
+            self._random_decisions.clear()
+            self._text_override_sessions.clear()
+            self._bypass_counts.clear()
+            if self.config.plugin.enabled and self._uses_voiceclone():
+                try:
+                    await self._ensure_reference_uri()
+                except (OSError, RuntimeError, ValueError) as exc:
+                    self.ctx.logger.error("热重载参考音频失败：%s", exc)
         self.ctx.logger.info(
             "TTS 配置已热重载：version=%s, 触发=%s, 合成=%s, 输出=%s, 测试命令白名单=%d",
             version,
@@ -332,7 +345,18 @@ class LingTTSBot(MaiBotPlugin):
             "default=noprint_wrappers=1:nokey=1",
             str(audio_file),
         ]
-        probe_result = subprocess.run(probe_command, capture_output=True, check=False, text=True)
+        try:
+            probe_result = subprocess.run(
+                probe_command,
+                capture_output=True,
+                check=False,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=FFMPEG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"ffprobe 读取 {audio_file.name} 超过 {FFMPEG_TIMEOUT_SECONDS} 秒") from exc
         if probe_result.returncode != 0:
             error = probe_result.stderr.strip() or f"退出码 {probe_result.returncode}"
             raise RuntimeError(f"ffprobe 无法读取 {audio_file.name}：{error[-500:]}")
@@ -356,7 +380,18 @@ class LingTTSBot(MaiBotPlugin):
             "null",
             os.devnull,
         ]
-        silence_result = subprocess.run(silence_command, capture_output=True, check=False, text=True)
+        try:
+            silence_result = subprocess.run(
+                silence_command,
+                capture_output=True,
+                check=False,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=FFMPEG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"FFmpeg 静音检测超过 {FFMPEG_TIMEOUT_SECONDS} 秒（{audio_file.name}）") from exc
         if silence_result.returncode != 0:
             error = silence_result.stderr.strip() or f"退出码 {silence_result.returncode}"
             raise RuntimeError(f"FFmpeg 静音检测失败（{audio_file.name}）：{error[-500:]}")
@@ -404,7 +439,19 @@ class LingTTSBot(MaiBotPlugin):
 
     @staticmethod
     def _run_ffmpeg(command: List[str], temporary_path: Path, error_prefix: str) -> None:
-        completed = subprocess.run(command, capture_output=True, check=False, text=True)
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=FFMPEG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            temporary_path.unlink(missing_ok=True)
+            raise RuntimeError(f"{error_prefix}：超过 {FFMPEG_TIMEOUT_SECONDS} 秒") from exc
         if completed.returncode != 0:
             temporary_path.unlink(missing_ok=True)
             error = completed.stderr.strip() or f"退出码 {completed.returncode}"
@@ -500,6 +547,7 @@ class LingTTSBot(MaiBotPlugin):
             mime_type = "audio/mpeg" if output_path.suffix == ".mp3" else "audio/wav"
             self._reference_uri = f"data:{mime_type};base64,{reference_base64}"
             self._reference_signature = signature
+            self._prune_reference_cache(output_path)
             self.ctx.logger.info(
                 "参考音频已就绪：策略=%s, 源文件数=%d, 参考文件=%s, Base64=%.2fMB",
                 self.config.voice.reference_strategy,
@@ -508,6 +556,16 @@ class LingTTSBot(MaiBotPlugin):
                 len(reference_base64) / 1024 / 1024,
             )
             return self._reference_uri
+
+    def _prune_reference_cache(self, keep: Path) -> None:
+        """只保留当前签名的参考音频，避免每次换音色都在 runtime 目录里堆积。"""
+
+        if self._cache_dir is None:
+            return
+        for path in self._cache_dir.iterdir():
+            if not path.is_file() or path == keep or not REFERENCE_CACHE_NAME.match(path.name):
+                continue
+            path.unlink(missing_ok=True)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -623,10 +681,31 @@ class LingTTSBot(MaiBotPlugin):
         raw_message = message.get("raw_message")
         if not isinstance(raw_message, list) or not raw_message:
             return None
-        if any(not isinstance(item, dict) or item.get("type") != "text" for item in raw_message):
+        texts: List[str] = []
+        for item in raw_message:
+            if not isinstance(item, dict):
+                return None
+            item_type = item.get("type")
+            # 引用段是发送前才插入的，不能因此把整条回复当成非文本。
+            if item_type == "reply":
+                continue
+            if item_type != "text":
+                return None
+            data = item.get("data")
+            if isinstance(data, dict):
+                data = data.get("text") or ""
+            texts.append(str(data or ""))
+        if not texts:
             return None
-        text = "".join(str(item.get("data") or "") for item in raw_message).strip()
+        text = "".join(texts).strip()
         return text or None
+
+    @staticmethod
+    def _is_plugin_notice(text: str) -> bool:
+        """命令回执不能再送去合成，否则会把「语音已发送」又读一遍。"""
+
+        stripped = text.strip()
+        return stripped in PLUGIN_NOTICE_EXACT or stripped.startswith("语音合成失败：")
 
     def _text_override_active(self, stream_id: str) -> bool:
         """检查当前聊天流是否仍处于 LLM 选择的文字回复会话窗口。"""
@@ -713,6 +792,8 @@ class LingTTSBot(MaiBotPlugin):
         if candidate is None:
             return None
         outbound, stream_id, text = candidate
+        if self._is_plugin_notice(text):
+            return None
         if self.config.trigger.mode == "llm_trigger" and self._text_override_active(stream_id):
             self.ctx.logger.info("LLM 已选择文字回复，保留聊天流 %s 的文字及引用关系", stream_id)
             return None
@@ -720,6 +801,9 @@ class LingTTSBot(MaiBotPlugin):
         if self.config.output.mode == "text_and_voice":
             return None
         if not self._should_voice(stream_id):
+            return None
+        if not self._clean_text(text):
+            self.ctx.logger.info("没有可朗读的文本，保留聊天流 %s 的原文", stream_id)
             return None
 
         try:
@@ -770,13 +854,15 @@ class LingTTSBot(MaiBotPlugin):
         if candidate is None:
             return None
         _outbound, stream_id, text = candidate
+        if self._is_plugin_notice(text) or not self._clean_text(text):
+            return None
         if not self._should_voice(stream_id):
             return None
 
         try:
             audio = await self._synthesize(text)
             sent = await self._send_voice(audio, stream_id, text, remember_history=False)
-        except (OSError, RuntimeError, ValueError) as exc:
+        except Exception as exc:
             self.ctx.logger.error("补发语音失败，文字已保留：%s", exc)
             return None
         if sent:
@@ -957,7 +1043,7 @@ class LingTTSBot(MaiBotPlugin):
                 )
             audio = await self._synthesize(clean_text)
             sent = await self._send_voice(audio, stream_id, clean_text, remember_history=not send_text)
-        except (OSError, RuntimeError, ValueError) as exc:
+        except Exception as exc:
             self.ctx.logger.error("手动 TTS 失败：%s", exc)
             return False, f"语音合成失败：{exc}", True
         finally:
