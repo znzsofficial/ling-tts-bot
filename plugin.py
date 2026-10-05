@@ -15,6 +15,8 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
+from datetime import datetime
 
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ActivationType, ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
@@ -890,9 +892,21 @@ class LingTTSBot(MaiBotPlugin):
                 if self._tool_definition_name(item) != TEXT_REPLY_TOOL_NAME
             ]
         elif self.config.trigger.mode == "llm_trigger":
+            instruction = self._planner_instruction()
+            items = kwargs.get("items")
+            if isinstance(items, list):
+                if not any(part.get("text") == instruction for item in items if isinstance(item, dict)
+                           for part in item.get("parts", []) if isinstance(part, dict)):
+                    items.append({
+                        "item_type": "SystemMessageItem",
+                        "meta": {"item_id": uuid.uuid4().hex, "logical_turn_id": None,
+                                 "timestamp": datetime.now().isoformat()},
+                        "parts": [{"type": "text", "text": instruction}],
+                    })
+                kwargs["items"] = items
             messages = kwargs.get("messages")
-            if isinstance(messages, list):
-                messages.append({"role": "system", "content": self._planner_instruction()})
+            if isinstance(messages, list) and not any(isinstance(m, dict) and m.get("content") == instruction for m in messages):
+                messages.append({"role": "system", "content": instruction})
                 kwargs["messages"] = messages
         return {"action": "continue", "modified_kwargs": kwargs}
 
