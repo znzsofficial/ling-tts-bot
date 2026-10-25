@@ -955,11 +955,9 @@ class LingTTSBot(MaiBotPlugin):
 
     @Tool(
         TEXT_REPLY_TOOL_NAME,
-        brief_description="让当前回复会话只发文字、不附带语音",
-        detailed_description=(
-            "默认不要调用。"
-            "仅当代码、网址、表格、长列表、精确格式或用户明确只要文字时调用，"
-            "然后调用普通 reply；当前回复会话不再附加或替换为语音，并可正常引用消息。"
+        brief_description=(
+            "默认不调用；仅当代码、网址、表格、长列表、精确格式或用户明确只要文字时调用，"
+            "然后照常 reply，本回复只发文字不附语音。"
         ),
         activation_type=ActivationType.ALWAYS,
         parameters=[
